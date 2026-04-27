@@ -1,0 +1,185 @@
+// ============================================
+// ZAAS DATABASE SCHEMA
+// Phase 1 — PAYG Image to Cinematic Video
+// ============================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// USERS
+// Guest checkout supported (no password)
+// Registered users get order history
+// ============================================
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  name          String?
+  phone         String?
+  password      String?          // null = guest, bcrypt hashed = registered
+  is_active     Boolean  @default(true)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  orders        Order[]
+}
+
+// ============================================
+// TEMPLATES
+// 3 personal + 5 business = 8 total
+// Owned by ZAAS — no external platform dependency
+// preview_url = pre-rendered demo video on Cloudinary
+// ai_prompt   = sent to fal.ai for hero photo motion
+// music_file  = royalty-free track, overlaid by ffmpeg
+// engine      = seedance | kling (fal.ai endpoint selector)
+// ============================================
+model Template {
+  id              String   @id @default(uuid())
+  name            String   // "Cinematic Memory"
+  slug            String   @unique // "cinematic-memory"
+  category        String   // personal | business
+  tagline         String   // "For weddings, family & anniversaries"
+  description     String   // shown on template card
+  best_for        String   // "Weddings, anniversaries, family trips"
+
+  // AI Engine
+  engine          String   // seedance | kling
+  ai_prompt       String   // motion prompt sent to fal.ai for hero photo
+  // personal  → Seedance 1.5 Pro → audio ON
+  // business  → Kling 3.0 Pro    → audio ON
+
+  // Atmosphere vs Subject motion
+  // atmosphere = animate surroundings (bokeh, light, curtains) — group photos
+  // subject    = animate people/product directly — 1-3 people or single product
+  motion_mode     String   @default("subject") // subject | atmosphere
+
+  // Post-production (ffmpeg)
+  music_file      String   // royalty-free track filename on server
+  transition_type String   @default("crossfade") // crossfade | dissolve | cut
+
+  // UI Assets
+  preview_url     String?  // pre-rendered demo video on Cloudinary (user sees before paying)
+  thumbnail_url   String?  // template card cover image
+
+  // Pricing
+  price           Decimal  @db.Decimal(10, 2) // 12.99 personal | 19.99 business
+
+  sort_order      Int
+  is_active       Boolean  @default(true)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  orders          Order[]
+}
+
+// ============================================
+// ORDERS
+// One order = one cinematic video
+// Lifecycle: created → paid → processing → completed | failed
+//
+// GPS stored for Phase 1 marketplace cross-sell popup
+// while user waits for video to render
+// ============================================
+model Order {
+  id            String   @id @default(uuid())
+
+  // User — registered or guest
+  user_id       String?
+  user          User?    @relation(fields: [user_id], references: [id])
+  guest_email   String?  // used when no account
+
+  // Template snapshot at time of order
+  template_id   String
+  template      Template @relation(fields: [template_id], references: [id])
+  category      String   // personal | business
+  amount        Decimal  @db.Decimal(10, 2) // 12.99 | 19.99
+
+  // ==================
+  // GPS
+  // Captured at order creation
+  // Used to find 20km radius business listings
+  // for marketplace popup during render wait
+  // ==================
+  user_lat      Float?   // latitude
+  user_lng      Float?   // longitude
+  user_city     String?  // resolved city e.g. "Seremban"
+  location_granted Boolean @default(false) // did user grant GPS?
+
+  // ==================
+  // PAYMENT (Billplz FPX)
+  // Pay FIRST → render AFTER
+  // ==================
+  payment_status    String    @default("pending")
+  // pending | paid | failed
+  billplz_bill_id   String?   @unique
+  billplz_bill_url  String?   // redirect user here to pay
+  paid_at           DateTime?
+
+  // ==================
+  // VIDEO GENERATION (fal.ai async)
+  // Webhook-based — not synchronous
+  // ==================
+  video_status      String    @default("pending")
+  // pending | processing | stitching | completed | failed
+  fal_request_id    String?   // fal.ai async job ID for hero clip
+  fal_webhook_raw   String?   // raw fal.ai webhook payload (for debugging)
+  failure_reason    String?   // if failed, capture why
+
+  // ==================
+  // FINAL OUTPUT
+  // ffmpeg stitches hero AI clip + Ken Burns clips + music + ZAAS outro
+  // ==================
+  video_url         String?   // Cloudinary final video URL (shared with user)
+  video_public_id   String?   // Cloudinary public ID (for deletion at expiry)
+  video_thumbnail   String?   // first frame thumbnail shown in order page
+  video_duration    Float?    // total video duration in seconds
+  download_count    Int       @default(0)
+
+  // ==================
+  // EXPIRY
+  // 30 days after completion
+  // We delete Cloudinary asset after expiry
+  // ==================
+  expires_at        DateTime?
+  expiry_notified   Boolean   @default(false) // true = 3-day warning email sent
+  is_expired        Boolean   @default(false) // true = Cloudinary asset deleted
+
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
+
+  photos            OrderPhoto[]
+}
+
+// ============================================
+// ORDER PHOTOS
+// Max 10 photos per order
+// is_hero = true  → fal.ai AI motion (1 photo only)
+// is_hero = false → ffmpeg Ken Burns zoom/pan
+// sort_order = sequence in final stitched video (1-10)
+//
+// Hero photo motion mode follows template.motion_mode:
+//   subject    → animate people/product
+//   atmosphere → animate surroundings only (group photos)
+// ============================================
+model OrderPhoto {
+  id                    String   @id @default(uuid())
+  order_id              String
+  order                 Order    @relation(fields: [order_id], references: [id])
+
+  cloudinary_url        String   // uploaded original photo URL
+  cloudinary_public_id  String   // for cleanup if order fails/expires
+
+  is_hero               Boolean  @default(false) // ONE per order gets AI motion
+  sort_order            Int      // 1-10, position in final video
+  file_size_kb          Int?     // for quality warning if too small
+  width                 Int?     // original photo dimensions
+  height                Int?     // original photo dimensions
+
+  created_at            DateTime @default(now())
+}
