@@ -5,7 +5,7 @@ const multer = require('multer');
 // MULTER CONFIG
 // Memory storage — files held in buffer
 // before uploading to Cloudinary
-// Max 10 photos, 10MB each
+// Max 4 photos, 10MB each
 // ============================================
 const storage = multer.memoryStorage();
 
@@ -22,8 +22,8 @@ const upload = multer({
   storage,
   fileFilter,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB per file
-    files: 10                    // max 10 photos
+    fileSize: 10 * 1024 * 1024,
+    files: 4
   }
 });
 
@@ -31,8 +31,7 @@ const upload = multer({
 // UPLOAD PHOTOS
 // POST /api/upload/photos
 // Step 1 of order flow
-// Just uploads to Cloudinary, returns URLs
-// Hero selection happens in FE AFTER this
+// Uploads 4 photos to Cloudinary, returns URLs
 // ============================================
 const uploadPhotos = async (req, res) => {
   try {
@@ -43,14 +42,13 @@ const uploadPhotos = async (req, res) => {
       });
     }
 
-    if (req.files.length > 10) {
+    if (req.files.length > 4) {
       return res.status(400).json({
         success: false,
-        message: 'Maximum 10 photos allowed'
+        message: 'Maximum 4 photos allowed'
       });
     }
 
-    // Upload all photos to Cloudinary in parallel
     const uploadPromises = req.files.map((file, index) => {
       return new Promise((resolve, reject) => {
         const uploadStream = cloudinary.uploader.upload_stream(
@@ -70,8 +68,7 @@ const uploadPhotos = async (req, res) => {
               width: result.width,
               height: result.height,
               file_size_kb: Math.round(result.bytes / 1024),
-              sort_order: index + 1,
-              is_hero: false // hero selected by USER in FE after upload
+              sort_order: index + 1
             });
           }
         );
@@ -81,7 +78,6 @@ const uploadPhotos = async (req, res) => {
 
     const uploadedPhotos = await Promise.all(uploadPromises);
 
-    // Quality warning — flag photos under 100kb as potentially low quality
     const lowQualityPhotos = uploadedPhotos.filter(p => p.file_size_kb < 100);
 
     res.json({
@@ -90,7 +86,6 @@ const uploadPhotos = async (req, res) => {
       data: {
         photos: uploadedPhotos,
         total: uploadedPhotos.length,
-        hero_public_id: null, // user picks this in FE
         quality_warning: lowQualityPhotos.length > 0
           ? `${lowQualityPhotos.length} photo(s) may be low quality. For best results upload clear, well-lit photos minimum 1MB each.`
           : null

@@ -1,8 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { falaiWebhook } = require('../controllers/webhookController');
+const { wavespeedWebhook } = require('../controllers/webhookController');
 
-// POST fal.ai webhook
-router.post('/falai', falaiWebhook);
+// POST Wavespeed webhook
+router.post('/wavespeed', wavespeedWebhook);
 
 module.exports = router;

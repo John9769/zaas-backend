@@ -1,188 +1,177 @@
 const prisma = require('../utils/prisma');
 const cloudinary = require('../utils/cloudinary');
-const { execSync } = require('child_process');
-const https = require('https');
-const fs = require('fs');
-const path = require('path');
+const { submitVaceJoin, getJobStatus } = require('../utils/wavespeed');
+const { triggerVideoGeneration } = require('./orderController');
 
-const falaiWebhook = async (req, res) => {
+// ============================================
+// WAVESPEED WEBHOOK
+// POST /api/webhooks/wavespeed
+// Receives completion for each I2V clip
+// When all 4 clips done → fire VACE joiner
+// ============================================
+const wavespeedWebhook = async (req, res) => {
   try {
     const payload = req.body;
-    console.log('📥 fal.ai webhook received:', JSON.stringify(payload, null, 2));
+    console.log('📥 Wavespeed webhook received:', JSON.stringify(payload, null, 2));
 
-    const { request_id, status, output, error } = payload;
+    const jobId = payload.id;
+    const status = payload.status;
+    const outputUrl = payload.outputs?.[0] || payload.output?.url || null;
 
-    if (!request_id) {
-      return res.status(400).json({ success: false, message: 'Missing request_id' });
+    if (!jobId) {
+      return res.status(400).json({ success: false, message: 'Missing job ID' });
     }
 
-    const order = await prisma.order.findFirst({
-      where: { fal_request_id: request_id },
-      include: {
-        photos: { orderBy: { sort_order: 'asc' } },
-        template: true
-      }
+    // Find which photo this job belongs to
+    const photo = await prisma.orderPhoto.findFirst({
+      where: { wavespeed_job_id: jobId }
     });
 
-    if (!order) {
-      console.error(`❌ Order not found for request_id: ${request_id}`);
-      return res.status(404).json({ success: false, message: 'Order not found' });
+    // Could be VACE joiner job
+    if (!photo) {
+      const order = await prisma.order.findFirst({
+        where: { vace_job_id: jobId }
+      });
+
+      if (order) {
+        await handleVaceCompletion(order, status, outputUrl, payload);
+        return res.json({ success: true, message: 'VACE completion handled' });
+      }
+
+      console.error(`❌ No photo or order found for job: ${jobId}`);
+      return res.status(404).json({ success: false, message: 'Job not found' });
     }
 
-    if (status === 'ERROR' || error) {
+    // Handle I2V clip completion
+    if (status === 'failed' || status === 'error') {
+      console.error(`❌ Clip failed for photo ${photo.id}`);
+
+      await prisma.orderPhoto.update({
+        where: { id: photo.id },
+        data: { wavespeed_clip_url: null }
+      });
+
+      // Mark order as failed + trigger refund
       await prisma.order.update({
-        where: { id: order.id },
+        where: { id: photo.order_id },
         data: {
           video_status: 'failed',
-          failure_reason: error?.message || 'fal.ai generation failed',
-          fal_webhook_raw: JSON.stringify(payload)
+          failure_reason: `Clip generation failed for photo ${photo.sort_order}`,
+          refund_status: 'pending'
         }
       });
-      console.error(`❌ fal.ai failed for order ${order.id}:`, error);
+
       return res.json({ success: true, message: 'Failure recorded' });
     }
 
-    if (status === 'OK' && output?.video?.url) {
-      const heroVideoUrl = output.video.url;
-      console.log(`✅ Hero clip ready for order ${order.id}: ${heroVideoUrl}`);
+    if (status === 'completed' && outputUrl) {
+      console.log(`✅ Clip ready for photo ${photo.sort_order}: ${outputUrl}`);
 
-      await prisma.order.update({
-        where: { id: order.id },
-        data: {
-          video_status: 'stitching',
-          fal_webhook_raw: JSON.stringify(payload)
-        }
+      // Save clip URL to photo
+      await prisma.orderPhoto.update({
+        where: { id: photo.id },
+        data: { wavespeed_clip_url: outputUrl }
       });
 
-      stitchVideo(order, heroVideoUrl).catch(async (err) => {
-        console.error(`❌ Stitch failed for order ${order.id}:`, err);
+      // Check if ALL 4 clips are ready
+      const allPhotos = await prisma.orderPhoto.findMany({
+        where: { order_id: photo.order_id },
+        orderBy: { sort_order: 'asc' }
+      });
+
+      const allClipsReady = allPhotos.every(p => p.wavespeed_clip_url !== null);
+
+      if (allClipsReady) {
+        console.log(`🎬 All 4 clips ready for order ${photo.order_id} — firing VACE joiner`);
+
+        const clipUrls = allPhotos.map(p => p.wavespeed_clip_url);
+
+        // Submit VACE joiner
+        const vaceJob = await submitVaceJoin(clipUrls);
+        const vaceJobId = vaceJob?.data?.id;
+
         await prisma.order.update({
-          where: { id: order.id },
-          data: { video_status: 'failed', failure_reason: err.message }
+          where: { id: photo.order_id },
+          data: {
+            video_status: 'stitching',
+            vace_job_id: vaceJobId,
+            wavespeed_clip_urls: JSON.stringify(clipUrls)
+          }
         });
-      });
 
-      return res.json({ success: true, message: 'Hero clip received, stitching started' });
+        console.log(`✅ VACE job submitted: ${vaceJobId}`);
+      }
+
+      return res.json({ success: true, message: 'Clip saved' });
     }
 
     res.json({ success: true, message: 'Status noted' });
 
   } catch (error) {
-    console.error('falaiWebhook error:', error);
+    console.error('wavespeedWebhook error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-const stitchVideo = async (order, heroVideoUrl) => {
-  const tmpDir = path.join('C:/tmp', `zaas_${order.id}`);
-
+// ============================================
+// HANDLE VACE COMPLETION
+// Final video ready — upload to Cloudinary
+// Update order completed
+// ============================================
+const handleVaceCompletion = async (order, status, outputUrl, payload) => {
   try {
-    fs.mkdirSync(tmpDir, { recursive: true });
-    console.log(`🎬 Starting stitch for order ${order.id}`);
-
-    const otherPhotos = order.photos.filter(p => !p.is_hero);
-    const clips = [];
-
-    // Step 1: Download hero AI clip
-    const heroClipPath = path.join(tmpDir, 'hero.mp4');
-    await downloadFile(heroVideoUrl, heroClipPath);
-    clips.push(heroClipPath);
-    console.log(`✅ Hero clip downloaded`);
-
-    // Step 2: Ken Burns on remaining photos
-    const effects = [
-      "zoompan=z='min(zoom+0.0015,1.5)':d=125:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-      "zoompan=z='if(lte(zoom,1.0),1.5,max(1.001,zoom-0.0015))':d=125:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-      "zoompan=z='min(zoom+0.0015,1.5)':d=125:x=0:y=0",
-      "zoompan=z='min(zoom+0.0015,1.5)':d=125:x='iw-iw/zoom':y='ih-ih/zoom'"
-    ];
-
-    for (let i = 0; i < otherPhotos.length; i++) {
-      const photo = otherPhotos[i];
-      const outputPath = path.join(tmpDir, `photo_${i}.mp4`);
-      const effect = effects[i % effects.length];
-
-      execSync(
-        `ffmpeg -i "${photo.cloudinary_url}" -vf "${effect},scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25" -t 4 -c:v libx264 -pix_fmt yuv420p "${outputPath}" -y`,
-        { timeout: 60000 }
-      );
-
-      clips.push(outputPath);
-      console.log(`✅ Ken Burns clip ${i + 1} done`);
+    if (status === 'failed' || status === 'error') {
+      await prisma.order.update({
+        where: { id: order.id },
+        data: {
+          video_status: 'failed',
+          failure_reason: 'VACE stitching failed',
+          refund_status: 'pending'
+        }
+      });
+      console.error(`❌ VACE failed for order ${order.id}`);
+      return;
     }
 
-    // Step 3: Create concat list
-    const concatListPath = path.join(tmpDir, 'concat.txt');
-    const concatContent = clips.map(c => `file '${c}'`).join('\n');
-    fs.writeFileSync(concatListPath, concatContent);
+    if (status === 'completed' && outputUrl) {
+      console.log(`✅ VACE complete for order ${order.id}: ${outputUrl}`);
 
-    // Step 4: Stitch all clips
-    const stitchedPath = path.join(tmpDir, 'stitched.mp4');
-    execSync(
-      `ffmpeg -f concat -safe 0 -i "${concatListPath}" -c copy "${stitchedPath}" -y`,
-      { timeout: 120000 }
-    );
-    console.log(`✅ Clips stitched`);
+      // Upload to Cloudinary
+      const cloudinaryResult = await cloudinary.uploader.upload(outputUrl, {
+        folder: 'zaas/videos',
+        resource_type: 'video',
+        public_id: `zaas_${order.id}`
+      });
 
-    // Step 5: Add ZAAS watermark
-    const finalPath = path.join(tmpDir, 'final.mp4');
-    execSync(
-      `ffmpeg -i "${stitchedPath}" -vf "drawtext=text='ZAAS':fontsize=36:fontcolor=white:x=w-tw-20:y=h-th-20:alpha=0.7" -c:v libx264 -c:a aac "${finalPath}" -y`,
-      { timeout: 180000 }
-    );
-    console.log(`✅ Watermark added`);
+      console.log(`✅ Final video on Cloudinary: ${cloudinaryResult.secure_url}`);
 
-    // Step 6: Upload to Cloudinary
-    const cloudinaryResult = await cloudinary.uploader.upload(finalPath, {
-      folder: 'zaas/videos',
-      resource_type: 'video',
-      public_id: `zaas_${order.id}`
-    });
-    console.log(`✅ Final video uploaded: ${cloudinaryResult.secure_url}`);
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + 30);
 
-    // Step 7: Update order completed
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 30);
+      await prisma.order.update({
+        where: { id: order.id },
+        data: {
+          video_status: 'completed',
+          video_url: cloudinaryResult.secure_url,
+          video_public_id: cloudinaryResult.public_id,
+          video_duration: cloudinaryResult.duration || null,
+          expires_at: expiresAt
+        }
+      });
 
+      console.log(`🎉 Order ${order.id} completed!`);
+    }
+  } catch (error) {
+    console.error(`❌ handleVaceCompletion error:`, error);
     await prisma.order.update({
       where: { id: order.id },
       data: {
-        video_status: 'completed',
-        video_url: cloudinaryResult.secure_url,
-        video_public_id: cloudinaryResult.public_id,
-        video_duration: cloudinaryResult.duration || null,
-        expires_at: expiresAt
+        video_status: 'failed',
+        failure_reason: error.message,
+        refund_status: 'pending'
       }
     });
-
-    console.log(`🎉 Order ${order.id} completed!`);
-
-  } catch (error) {
-    console.error(`❌ stitchVideo error:`, error);
-    throw error;
-  } finally {
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch (e) {
-      console.error('Cleanup error:', e);
-    }
   }
 };
 
-const downloadFile = (url, dest) => {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
-    https.get(url, (response) => {
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close();
-        resolve();
-      });
-    }).on('error', (err) => {
-      fs.unlink(dest, () => {});
-      reject(err);
-    });
-  });
-};
-
-module.exports = { falaiWebhook };
+module.exports = { wavespeedWebhook };

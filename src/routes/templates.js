@@ -10,7 +10,7 @@ const {
 // GET all templates
 router.get('/', getAllTemplates);
 
-// GET by category → personal | business
+// GET by category → casual | product
 router.get('/category/:category', getTemplatesByCategory);
 
 // GET single template by slug

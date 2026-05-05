@@ -63,7 +63,7 @@ app.use((err, req, res, next) => {
 // START SERVER
 // ============================================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 ZAAS Backend running on port ${PORT}`);
   console.log(`📦 Environment: ${process.env.NODE_ENV}`);
   console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL}`);
