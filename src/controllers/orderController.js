@@ -63,7 +63,10 @@ const createOrder = async (req, res) => {
 
     await prisma.orderPhoto.createMany({ data: photoData });
 
-    // Return order immediately — Groq + Wavespeed fires after payment
+    // Trigger video generation immediately for testing — move to after Billplz payment later
+    triggerVideoGeneration(order.id);
+
+    // Return order immediately
     res.json({
       success: true,
       message: 'Order created. Proceed to payment.',

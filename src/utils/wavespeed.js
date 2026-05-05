@@ -10,7 +10,7 @@ const WAVESPEED_BASE = 'https://api.wavespeed.ai/api/v3';
 // ============================================
 const submitI2VJob = async (imageUrl, prompt) => {
   const response = await axios.post(
-    `${WAVESPEED_BASE}/bytedance/seedance-2.0/image-to-video`,
+    `${WAVESPEED_BASE}/alibaba/wan-2.7/image-to-video`,
     {
       image: imageUrl,
       prompt: prompt,
